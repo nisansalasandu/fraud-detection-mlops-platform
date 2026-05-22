@@ -6,7 +6,7 @@
 ![MLflow](https://img.shields.io/badge/MLflow-latest-orange)
 ![FastAPI](https://img.shields.io/badge/FastAPI-latest-green)
 ![Docker](https://img.shields.io/badge/Docker-ready-blue)
-![CI/CD](https://github.com/YOUR_USERNAME/fraud-detection-mlops-platform/actions/workflows/ci_cd.yml/badge.svg)
+![CI/CD](https://github.com/nisansalasandu/fraud-detection-mlops-platform/actions/workflows/ci_cd.yml/badge.svg)
 
 ## 🏗️ Architecture
 Data → Preprocessing → MLflow Training → Model Registry → FastAPI → Docker → Render
