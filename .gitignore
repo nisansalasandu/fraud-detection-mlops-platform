@@ -81,10 +81,10 @@ cython_debug/
 tempCodeRunnerFile.py
 
 # Project-specific (large files, secrets, generated artifacts)
-data/
-models/
-mlruns/
+data/raw/
+data/processed/*.csv
 .env
+mlruns/
 mlartifacts/
 
 # Kaggle credentials — never commit this
