@@ -1,0 +1,18 @@
+# .dockerignore
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.github/
+notebooks/
+data/raw/
+mlruns/
+mlartifacts/
+*.ipynb
+.env
+.gitignore
+tests/
+monitoring/
+README.md
+docker-compose.yml
