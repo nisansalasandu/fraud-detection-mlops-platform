@@ -19,6 +19,7 @@ from pathlib import Path
 
 import joblib
 import mlflow
+import mlflow.xgboost          # fixed: was mlflow.sklearn for an XGBoost model
 import numpy as np
 import pandas as pd
 
@@ -43,69 +44,85 @@ DRIFT_THRESHOLD = 0.3   # retrain if more than 30% of features drift
 # Drift detection
 # -----------------------------------------------------------
 def detect_drift(
-    reference_path: str | Path = DATA_DIR / "X_train.csv",
-    current_path:   str | Path = DATA_DIR / "X_test.csv",
+    reference_path = DATA_DIR / "X_train.csv",
+    current_path   = DATA_DIR / "X_test.csv",
     threshold: float = DRIFT_THRESHOLD,
 ) -> dict:
     """
     Run Evidently drift detection between reference and current datasets.
-    Returns a summary dict and writes JSON + HTML reports.
+    Returns a summary dict and writes JSON + HTML reports to monitoring/reports/.
     """
     try:
         from evidently.report import Report
         from evidently.metric_preset import DataDriftPreset
     except ImportError:
-        log.error("evidently is not installed. Run: pip install evidently")
+        log.error("evidently is not installed. Run: pip install evidently==0.4.30")
         raise
 
     log.info("Loading reference data from %s", reference_path)
     reference = pd.read_csv(reference_path)
     current   = pd.read_csv(current_path)
 
-    log.info("Running Evidently DataDriftPreset (%d ref rows, %d cur rows)",
-             len(reference), len(current))
+    log.info(
+        "Running Evidently DataDriftPreset (%d ref rows, %d cur rows)",
+        len(reference), len(current)
+    )
 
     report = Report(metrics=[DataDriftPreset()])
     report.run(reference_data=reference, current_data=current)
 
     result = report.as_dict()
 
+    # -----------------------------------------------------------
     # Parse per-feature drift results
-    feature_drift: dict[str, bool] = {}
+    # Evidently v0.4.x stores overall summary in metrics[0]
+    # and per-feature results in metrics[1..N] each with "column_name"
+    # -----------------------------------------------------------
+    feature_drift: dict = {}
     try:
-        metrics = result["metrics"]
-        for metric in metrics:
-            if metric.get("metric") == "DataDriftTable":
-                drift_by_columns = metric["result"].get("drift_by_columns", {})
-                for col, info in drift_by_columns.items():
-                    feature_drift[col] = bool(info.get("drift_detected", False))
-                break
-    except (KeyError, TypeError) as e:
-        log.warning("Could not parse per-feature drift: %s", e)
+        metrics_list = result["metrics"]
 
-    drifted     = sum(1 for v in feature_drift.values() if v)
-    total       = len(feature_drift) or 1
-    drift_share = round(drifted / total, 4)
+        # Approach: iterate all metric entries, pick ones that have column_name
+        for metric_entry in metrics_list:
+            entry_result = metric_entry.get("result", {})
+            if "column_name" in entry_result:
+                col     = entry_result["column_name"]
+                drifted = bool(entry_result.get("drift_detected", False))
+                feature_drift[col] = drifted
+
+        # Fallback: some versions use drift_by_columns in the first metric
+        if not feature_drift:
+            first = metrics_list[0].get("result", {})
+            drift_by_columns = first.get("drift_by_columns", {})
+            for col, info in drift_by_columns.items():
+                feature_drift[col] = bool(info.get("drift_detected", False))
+
+    except (KeyError, TypeError, IndexError) as e:
+        log.warning("Could not parse per-feature drift details: %s", e)
+
+    drifted      = sum(1 for v in feature_drift.values() if v)
+    total_feats  = len(feature_drift) or 1
+    drift_share  = round(drifted / total_feats, 4)
     drifted_flag = drift_share > threshold
 
     summary = {
         "timestamp":         datetime.now(timezone.utc).isoformat(),
         "dataset_drifted":   drifted_flag,
         "drifted_features":  drifted,
-        "total_features":    total,
+        "total_features":    total_feats,
         "drift_share":       drift_share,
         "threshold":         threshold,
         "retrain_triggered": drifted_flag,
         "feature_drift":     feature_drift,
     }
 
-    # Save JSON summary
+    # Save JSON summary — read by the /dashboard and /metrics endpoints
     with open(DRIFT_SUMMARY, "w") as f:
         json.dump(summary, f, indent=2)
     log.info("Drift summary saved to %s", DRIFT_SUMMARY)
 
-    # Save HTML report
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    # Save full HTML report for manual review
+    ts        = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     html_path = REPORTS_DIR / f"drift_report_{ts}.html"
     report.save_html(str(html_path))
     log.info("Drift HTML report saved to %s", html_path)
@@ -116,42 +133,45 @@ def detect_drift(
 # -----------------------------------------------------------
 # Automated retraining
 # -----------------------------------------------------------
-def retrain_model(summary: dict | None = None) -> dict:
+def retrain_model(summary: dict = None) -> dict:
     """
-    Retrain the XGBoost model on the combined train+test data.
-    Logs the run to MLflow and saves the new model to models/best_model.pkl.
+    Retrain the XGBoost model on combined train+test data.
+    Logs the run to MLflow and saves the updated model to models/best_model.pkl.
     Returns a result dict with new metrics.
     """
     from sklearn.metrics import roc_auc_score, f1_score
     from xgboost import XGBClassifier
 
-    log.info("Loading training data for retraining...")
+    log.info("Loading data for retraining...")
     X_train = pd.read_csv(DATA_DIR / "X_train.csv")
     y_train = pd.read_csv(DATA_DIR / "y_train.csv").squeeze()
     X_test  = pd.read_csv(DATA_DIR / "X_test.csv")
     y_test  = pd.read_csv(DATA_DIR / "y_test.csv").squeeze()
 
-    # Combine train + test for retraining (simulate new incoming data)
+    # Combine train + test to include all available data
     X_combined = pd.concat([X_train, X_test], ignore_index=True)
     y_combined = pd.concat([y_train, y_test], ignore_index=True)
 
+    fraud_count     = int((y_combined == 1).sum())
+    non_fraud_count = int((y_combined == 0).sum())
+
     params = {
-        "n_estimators":    300,
-        "max_depth":       6,
-        "learning_rate":   0.05,
-        "scale_pos_weight": int((y_combined == 0).sum() / (y_combined == 1).sum()),
-        "subsample":       0.8,
+        "n_estimators":     300,
+        "max_depth":        6,
+        "learning_rate":    0.05,
+        "scale_pos_weight": non_fraud_count // max(fraud_count, 1),
+        "subsample":        0.8,
         "colsample_bytree": 0.8,
-        "random_state":    42,
-        "n_jobs":          -1,
-        "eval_metric":     "logloss",
+        "random_state":     42,
+        "n_jobs":           -1,
+        "eval_metric":      "logloss",
     }
 
     log.info("Retraining XGBoost on %d samples...", len(X_combined))
     clf = XGBClassifier(**params)
     clf.fit(X_combined, y_combined, verbose=False)
 
-    # Evaluate on held-out test set
+    # Evaluate on the held-out test set
     y_pred  = clf.predict(X_test)
     y_proba = clf.predict_proba(X_test)[:, 1]
     roc_auc = round(float(roc_auc_score(y_test, y_proba)), 4)
@@ -159,12 +179,15 @@ def retrain_model(summary: dict | None = None) -> dict:
 
     log.info("Retrained model — ROC-AUC: %.4f  F1: %.4f", roc_auc, f1)
 
-    # Save model
+    # Save model to disk
     model_path = MODELS_DIR / "best_model.pkl"
     joblib.dump(clf, model_path)
     log.info("Updated model saved to %s", model_path)
 
-    # Log to MLflow
+    # Log run to MLflow
+    mlflow.set_tracking_uri(str(BASE_DIR / "mlruns"))
+    mlflow.set_experiment("fraud-detection")
+
     with mlflow.start_run(run_name="auto_retrain"):
         mlflow.log_params(params)
         mlflow.log_params({
@@ -173,7 +196,9 @@ def retrain_model(summary: dict | None = None) -> dict:
             "drifted_feats": summary.get("drifted_features", "N/A") if summary else "manual",
         })
         mlflow.log_metrics({"retrain_roc_auc": roc_auc, "retrain_f1": f1})
-        mlflow.sklearn.log_model(clf, "model")
+
+        # Fixed: use mlflow.xgboost (not mlflow.sklearn) for XGBClassifier
+        mlflow.xgboost.log_model(clf, name="retrained_model")
 
     result = {
         "status":     "success",
@@ -187,16 +212,21 @@ def retrain_model(summary: dict | None = None) -> dict:
 
 
 # -----------------------------------------------------------
-# Main entry point for running directly
+# Main entry point
 # -----------------------------------------------------------
 def run_drift_and_retrain() -> dict:
     """
     Full pipeline: detect drift, retrain if needed.
-    Call this from a scheduler (APScheduler / cron) or the /retrain endpoint.
+    Called by the POST /retrain endpoint and can also be run directly:
+        python monitoring/drift_monitor.py
     """
     summary = detect_drift()
-    log.info("Drift summary: drifted=%s share=%.4f triggered=%s",
-             summary["dataset_drifted"], summary["drift_share"], summary["retrain_triggered"])
+    log.info(
+        "Drift summary: drifted=%s  share=%.4f  triggered=%s",
+        summary["dataset_drifted"],
+        summary["drift_share"],
+        summary["retrain_triggered"]
+    )
 
     retrain_result = {}
     if summary["retrain_triggered"]:

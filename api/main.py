@@ -3,12 +3,14 @@
 
 import joblib
 import json
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import deque
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -34,7 +36,7 @@ prediction_log = deque(maxlen=100)
 # -----------------------------------------------------------
 app = FastAPI(
     title="Fraud Detection API",
-    description="Real-time fraud prediction using XGBoost — MLOps Project",
+    description="Real-time fraud prediction using XGBoost — MLOps Internship Project",
     version="1.0.0"
 )
 
@@ -42,18 +44,18 @@ app = FastAPI(
 # Request schema — matches our 12 feature columns exactly
 # -----------------------------------------------------------
 class TransactionRequest(BaseModel):
-    step: int                        = Field(..., example=1,        description="Hour of simulation")
-    amount: float                    = Field(..., example=9839.64,   description="Transaction amount")
-    oldbalanceOrg: float             = Field(..., example=170136.0,  description="Sender balance before")
-    newbalanceOrig: float            = Field(..., example=160296.36, description="Sender balance after")
-    oldbalanceDest: float            = Field(..., example=0.0,       description="Recipient balance before")
-    newbalanceDest: float            = Field(..., example=0.0,       description="Recipient balance after")
-    type_encoded: int                = Field(..., example=1,         description="1=TRANSFER, 0=CASH_OUT")
-    orig_balance_diff: float         = Field(..., example=9839.64,   description="Sender balance difference")
-    dest_balance_diff: float         = Field(..., example=0.0,       description="Recipient balance difference")
-    orig_balance_zero: int           = Field(..., example=0,         description="1 if sender balance went to zero")
-    amount_to_balance_ratio: float   = Field(..., example=0.058,     description="Amount / sender original balance")
-    hour_of_day: int                 = Field(..., example=1,         description="Hour of day (step mod 24)")
+    step: int                      = Field(..., example=1,         description="Hour of simulation")
+    amount: float                  = Field(..., example=9839.64,   description="Transaction amount")
+    oldbalanceOrg: float           = Field(..., example=170136.0,  description="Sender balance before")
+    newbalanceOrig: float          = Field(..., example=160296.36, description="Sender balance after")
+    oldbalanceDest: float          = Field(..., example=0.0,       description="Recipient balance before")
+    newbalanceDest: float          = Field(..., example=0.0,       description="Recipient balance after")
+    type_encoded: int              = Field(..., example=1,         description="1=TRANSFER, 0=CASH_OUT")
+    orig_balance_diff: float       = Field(..., example=9839.64,   description="Sender balance difference")
+    dest_balance_diff: float       = Field(..., example=0.0,       description="Recipient balance difference")
+    orig_balance_zero: int         = Field(..., example=0,         description="1 if sender balance went to zero")
+    amount_to_balance_ratio: float = Field(..., example=0.058,     description="Amount / sender original balance")
+    hour_of_day: int               = Field(..., example=1,         description="Hour of day (step mod 24)")
 
 # -----------------------------------------------------------
 # Response schema
@@ -61,8 +63,16 @@ class TransactionRequest(BaseModel):
 class PredictionResponse(BaseModel):
     is_fraud: bool
     fraud_probability: float
-    risk_level: str          # LOW / MEDIUM / HIGH
+    risk_level: str           # LOW / MEDIUM / HIGH
     prediction_time: str
+
+# -----------------------------------------------------------
+# Helper — reload model from disk into memory
+# Called after retraining so the running API uses the new model
+# -----------------------------------------------------------
+def reload_model():
+    global model
+    model = joblib.load(MODEL_PATH)
 
 # -----------------------------------------------------------
 # Routes
@@ -70,28 +80,33 @@ class PredictionResponse(BaseModel):
 @app.get("/")
 def root():
     return {
-        "message": "Fraud Detection API is running",
-        "docs":    "/docs",
-        "health":  "/health",
+        "message":   "Fraud Detection API is running",
+        "docs":      "/docs",
+        "health":    "/health",
         "dashboard": "/dashboard"
     }
+
 
 @app.get("/health")
 def health():
     return {
-        "status":     "healthy",
-        "model":      MODEL_PATH.name,
-        "features":   len(FEATURES),
-        "timestamp":  datetime.now(timezone.utc).isoformat()
+        "status":    "healthy",
+        "model":     MODEL_PATH.name,
+        "features":  len(FEATURES),
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
+
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict(transaction: TransactionRequest):
     try:
+        # Build single-row dataframe in exact feature order the model expects
         data = pd.DataFrame([transaction.model_dump()], columns=FEATURES)
+
         prediction  = model.predict(data)[0]
         probability = float(model.predict_proba(data)[0][1])
 
+        # Risk level based on fraud probability
         if probability < 0.3:
             risk = "LOW"
         elif probability < 0.7:
@@ -106,7 +121,7 @@ def predict(transaction: TransactionRequest):
             prediction_time   = datetime.now(timezone.utc).isoformat()
         )
 
-        # Log for dashboard
+        # Append to in-memory log for the dashboard
         prediction_log.append({
             "time":        result.prediction_time,
             "is_fraud":    result.is_fraud,
@@ -119,6 +134,7 @@ def predict(transaction: TransactionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/model-info")
 def model_info():
     return {
@@ -128,16 +144,17 @@ def model_info():
         "description":  "XGBoost trained on PaySim synthetic financial transactions"
     }
 
+
 @app.get("/metrics")
 def metrics():
-    """JSON metrics endpoint — drift status + prediction stats."""
+    """JSON metrics endpoint — drift status + live prediction stats."""
     drift = {}
     if DRIFT_PATH.exists():
         with open(DRIFT_PATH) as f:
             drift = json.load(f)
 
-    logs = list(prediction_log)
-    total = len(logs)
+    logs        = list(prediction_log)
+    total       = len(logs)
     fraud_count = sum(1 for p in logs if p["is_fraud"])
     high_risk   = sum(1 for p in logs if p["risk"] == "HIGH")
 
@@ -151,17 +168,36 @@ def metrics():
         "api_version":        "1.0.0"
     }
 
+
 @app.post("/retrain")
-def retrain():
+def retrain(x_api_key: str = Header(default=None)):
     """
     Trigger drift detection and automated model retraining.
-    Returns drift summary and retraining metrics (if retraining ran).
+    Requires X-Api-Key header matching the RETRAIN_API_KEY environment variable.
+    Default key for local dev: 'dev-secret'
+
+    Example:
+        curl -X POST http://localhost:8000/retrain -H "X-Api-Key: dev-secret"
     """
+    # Simple API key check — prevents accidental or malicious retrain calls
+    expected_key = os.getenv("RETRAIN_API_KEY", "dev-secret")
+    if x_api_key != expected_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing X-Api-Key header"
+        )
+
     try:
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from monitoring.drift_monitor import run_drift_and_retrain
+
         result = run_drift_and_retrain()
+
+        # Reload the model into memory if retraining ran
+        if result.get("retrain", {}).get("status") == "success":
+            reload_model()
+
         return {
             "status":  "complete",
             "message": "Drift check and retrain pipeline finished.",
@@ -170,36 +206,50 @@ def retrain():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Retrain failed: {str(e)}")
 
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    """Live monitoring dashboard — renders in a browser."""
+    """Live monitoring dashboard — auto-refreshes every 30 seconds."""
     drift = {}
     if DRIFT_PATH.exists():
         with open(DRIFT_PATH) as f:
             drift = json.load(f)
 
-    logs = list(prediction_log)
+    logs        = list(prediction_log)
     total       = len(logs)
     fraud_count = sum(1 for p in logs if p["is_fraud"])
     fraud_rate  = round(fraud_count / total * 100, 1) if total else 0
     high_risk   = sum(1 for p in logs if p["risk"] == "HIGH")
 
-    drift_share    = drift.get("drift_share", 0)
-    drift_pct      = round(drift_share * 100, 1)
-    drifted_feats  = drift.get("drifted_features", 0)
-    total_feats    = drift.get("total_features", 12)
+    drift_share   = drift.get("drift_share", 0)
+    drift_pct     = round(drift_share * 100, 1)
+    drifted_feats = drift.get("drifted_features", 0)
+    total_feats   = drift.get("total_features", 12)
     retrain_status = "Triggered ✓" if drift.get("retrain_triggered") else "Not needed"
-    drift_ts       = drift.get("timestamp", "N/A")
+    drift_ts      = drift.get("timestamp", "N/A")
 
+    # Build feature drift table rows
     feature_rows = ""
     for feat, drifted in drift.get("feature_drift", {}).items():
         badge = (
-            '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-size:12px">Drifted</span>'
+            '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;'
+            'border-radius:4px;font-size:12px">Drifted</span>'
             if drifted else
-            '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:4px;font-size:12px">Stable</span>'
+            '<span style="background:#dcfce7;color:#166534;padding:2px 8px;'
+            'border-radius:4px;font-size:12px">Stable</span>'
         )
-        feature_rows += f"<tr><td style='padding:8px 12px'>{feat}</td><td style='padding:8px 12px'>{badge}</td></tr>"
+        feature_rows += (
+            f"<tr><td style='padding:8px 12px'>{feat}</td>"
+            f"<td style='padding:8px 12px'>{badge}</td></tr>"
+        )
 
+    if not feature_rows:
+        feature_rows = (
+            "<tr><td colspan='2' style='padding:12px;text-align:center;"
+            "color:#6b7280'>No drift data yet — call POST /retrain to run drift detection</td></tr>"
+        )
+
+    # Build recent predictions table rows
     recent_rows = ""
     for p in reversed(list(prediction_log)[-10:]):
         color = "#991b1b" if p["is_fraud"] else "#166534"
@@ -214,9 +264,22 @@ def dashboard():
         )
 
     if not recent_rows:
-        recent_rows = "<tr><td colspan='4' style='padding:12px;text-align:center;color:#6b7280'>No predictions yet — call /predict to see data here</td></tr>"
+        recent_rows = (
+            "<tr><td colspan='4' style='padding:12px;text-align:center;color:#6b7280'>"
+            "No predictions yet — call POST /predict to see data here</td></tr>"
+        )
 
+    # Drift bar color: green < 30%, amber 30-50%, red > 50%
+    bar_color = (
+        "#ef4444" if drift_pct > 50
+        else "#f59e0b" if drift_pct > 30
+        else "#22c55e"
+    )
+    drift_badge_class = "badge-bad" if drift.get("dataset_drifted") else "badge-ok"
+    drift_badge_text  = "Dataset drifted" if drift.get("dataset_drifted") else "No drift detected"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    threshold_pct = drift.get("threshold", 0.3) * 100
+    last_scan = drift_ts[:19] if drift_ts != "N/A" else "N/A"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -233,8 +296,7 @@ def dashboard():
   .subtitle {{ font-size: 13px; color: #64748b; margin-bottom: 24px; }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
            gap: 16px; margin-bottom: 24px; }}
-  .card {{ background: #fff; border: 1px solid #e2e8f0; border-radius: 10px;
-           padding: 20px; }}
+  .card {{ background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 20px; }}
   .card h3 {{ font-size: 12px; color: #64748b; text-transform: uppercase;
               letter-spacing: .05em; margin-bottom: 8px; }}
   .card .val {{ font-size: 32px; font-weight: 700; color: #0f172a; }}
@@ -246,18 +308,17 @@ def dashboard():
   th {{ text-align: left; padding: 8px 12px; font-size: 12px; color: #64748b;
         border-bottom: 1px solid #e2e8f0; font-weight: 500; }}
   td {{ border-bottom: 1px solid #f1f5f9; }}
-  .drift-bar-wrap {{ background:#f1f5f9; border-radius:6px; height:10px; margin-top:6px; }}
-  .drift-bar {{ height:10px; border-radius:6px;
-                background: {'#ef4444' if drift_pct > 50 else '#f59e0b' if drift_pct > 30 else '#22c55e'};
-                width:{drift_pct}%; }}
+  .drift-bar-wrap {{ background: #f1f5f9; border-radius: 6px; height: 10px; margin-top: 6px; }}
+  .drift-bar {{ height: 10px; border-radius: 6px;
+                background: {bar_color}; width: {drift_pct}%; }}
   .badge-ok  {{ background:#dcfce7;color:#166534;padding:3px 10px;border-radius:5px;font-size:12px; }}
   .badge-bad {{ background:#fee2e2;color:#991b1b;padding:3px 10px;border-radius:5px;font-size:12px; }}
-  footer {{ font-size:12px; color:#94a3b8; margin-top:16px; text-align:center; }}
+  footer {{ font-size: 12px; color: #94a3b8; margin-top: 16px; text-align: center; }}
 </style>
 </head>
 <body>
-<h1>🛡️ Fraud Detection — Monitoring Dashboard</h1>
-<p class="subtitle">Auto-refreshes every 30 seconds &nbsp;·&nbsp; Last updated: {now}</p>
+<h1>&#128737;&#65039; Fraud Detection &#8212; Monitoring Dashboard</h1>
+<p class="subtitle">Auto-refreshes every 30 seconds &nbsp;&middot;&nbsp; Last updated: {now}</p>
 
 <div class="grid">
   <div class="card">
@@ -285,14 +346,12 @@ def dashboard():
 
 <div class="section">
   <h2>Drift monitoring &nbsp;
-    <span class="{'badge-bad' if drift.get('dataset_drifted') else 'badge-ok'}">
-      {'Dataset drifted' if drift.get('dataset_drifted') else 'No drift detected'}
-    </span>
+    <span class="{drift_badge_class}">{drift_badge_text}</span>
     &nbsp;&nbsp;
     <span style="font-size:13px;color:#64748b">Retraining: {retrain_status}</span>
   </h2>
   <p style="font-size:13px;color:#64748b;margin-bottom:12px">
-    Threshold: {drift.get('threshold', 0.3)*100:.0f}% &nbsp;·&nbsp; Last scan: {drift_ts[:19] if drift_ts != 'N/A' else 'N/A'}
+    Threshold: {threshold_pct:.0f}% &nbsp;&middot;&nbsp; Last scan: {last_scan}
   </p>
   <table>
     <thead><tr><th>Feature</th><th>Status</th></tr></thead>
@@ -303,7 +362,9 @@ def dashboard():
 <div class="section">
   <h2>Recent predictions (last 10)</h2>
   <table>
-    <thead><tr><th>Timestamp</th><th>Result</th><th>Probability</th><th>Risk level</th></tr></thead>
+    <thead>
+      <tr><th>Timestamp</th><th>Result</th><th>Probability</th><th>Risk level</th></tr>
+    </thead>
     <tbody>{recent_rows}</tbody>
   </table>
 </div>
@@ -311,16 +372,29 @@ def dashboard():
 <div class="section">
   <h2>System info</h2>
   <table>
-    <tr><td style='padding:8px 12px;color:#64748b'>Model file</td><td style='padding:8px 12px'>{MODEL_PATH.name}</td></tr>
-    <tr><td style='padding:8px 12px;color:#64748b'>Features</td><td style='padding:8px 12px'>{len(FEATURES)} ({', '.join(FEATURES[:4])}…)</td></tr>
-    <tr><td style='padding:8px 12px;color:#64748b'>API version</td><td style='padding:8px 12px'>1.0.0</td></tr>
-    <tr><td style='padding:8px 12px;color:#64748b'>Docs</td>
-        <td style='padding:8px 12px'><a href="/docs" style="color:#3b82f6">/docs</a> &nbsp;·&nbsp;
-        <a href="/metrics" style="color:#3b82f6">/metrics (JSON)</a></td></tr>
+    <tr>
+      <td style='padding:8px 12px;color:#64748b'>Model file</td>
+      <td style='padding:8px 12px'>{MODEL_PATH.name}</td>
+    </tr>
+    <tr>
+      <td style='padding:8px 12px;color:#64748b'>Features</td>
+      <td style='padding:8px 12px'>{len(FEATURES)} ({', '.join(FEATURES[:4])}…)</td>
+    </tr>
+    <tr>
+      <td style='padding:8px 12px;color:#64748b'>API version</td>
+      <td style='padding:8px 12px'>1.0.0</td>
+    </tr>
+    <tr>
+      <td style='padding:8px 12px;color:#64748b'>Links</td>
+      <td style='padding:8px 12px'>
+        <a href="/docs" style="color:#3b82f6">/docs</a> &nbsp;&middot;&nbsp;
+        <a href="/metrics" style="color:#3b82f6">/metrics</a>
+      </td>
+    </tr>
   </table>
 </div>
 
-<footer>Fraud Detection MLOps Platform · Nisansala Ruwan Pathirana · Internship 2026</footer>
+<footer>Fraud Detection MLOps Platform &middot; Nisansala Ruwan Pathirana &middot; Internship 2026</footer>
 </body>
 </html>"""
     return HTMLResponse(content=html)
